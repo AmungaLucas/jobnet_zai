@@ -4,29 +4,39 @@ import { generateId } from '@/lib/crypto';
 import { validateSession } from '@/lib/session';
 import { cookies } from 'next/headers';
 import auditLogger from '@/lib/audit';
+import { sanitizeString, containsDangerousContent } from '@/lib/sanitize';
+import { addSecurityHeaders } from '@/lib/security';
 
-// GET - List jobs with search, filters, and pagination
+// Maximum payload size
+const MAX_PAYLOAD_SIZE = 20000;
+
+// GET - List jobs (public, read-only)
 export async function GET(request) {
   try {
     const pool = await getConnection();
     const { searchParams } = new URL(request.url);
 
-    // Pagination
-    const page = parseInt(searchParams.get('page') || '1');
-    const limit = parseInt(searchParams.get('limit') || '10');
+    // Pagination with limits
+    const page = Math.min(Math.max(parseInt(searchParams.get('page') || '1'), 1), 1000);
+    const limit = Math.min(Math.max(parseInt(searchParams.get('limit') || '10'), 1), 100);
     const offset = (page - 1) * limit;
 
-    // Search & Filters
-    const search = searchParams.get('search') || '';
-    const status = searchParams.get('status') || '';
-    const category = searchParams.get('category') || '';
-    const employmentType = searchParams.get('employmentType') || '';
-    const experienceLevel = searchParams.get('experienceLevel') || '';
-    const country = searchParams.get('country') || '';
-    const organizationId = searchParams.get('organizationId') || '';
-    const remote = searchParams.get('remote') || '';
-    const sortBy = searchParams.get('sortBy') || 'created_at';
-    const sortOrder = searchParams.get('sortOrder') || 'DESC';
+    // Sanitize search inputs
+    const search = sanitizeString(searchParams.get('search') || '', { maxLength: 100 });
+    const status = sanitizeString(searchParams.get('status') || '', { maxLength: 50 });
+    const category = sanitizeString(searchParams.get('category') || '', { maxLength: 50 });
+    const employmentType = sanitizeString(searchParams.get('employmentType') || '', { maxLength: 50 });
+    const experienceLevel = sanitizeString(searchParams.get('experienceLevel') || '', { maxLength: 50 });
+    const country = sanitizeString(searchParams.get('country') || '', { maxLength: 100 });
+    const organizationId = sanitizeString(searchParams.get('organizationId') || '', { maxLength: 32 });
+    const remote = searchParams.get('remote');
+    
+    // Validate sort column (whitelist)
+    const validSortColumns = ['created_at', 'job_title', 'view_count', 'apply_count', 'salary_min', 'updated_at', 'date_posted'];
+    const validSortOrder = ['ASC', 'DESC'];
+    const sortBy = validSortColumns.includes(searchParams.get('sortBy')) ? searchParams.get('sortBy') : 'created_at';
+    const sortOrderParam = (searchParams.get('sortOrder') || 'DESC').toUpperCase();
+    const sortOrder = validSortOrder.includes(sortOrderParam) ? sortOrderParam : 'DESC';
 
     // Build query
     let whereConditions = [];
@@ -77,12 +87,6 @@ export async function GET(request) {
       ? `WHERE ${whereConditions.join(' AND ')}`
       : '';
 
-    // Validate sort column
-    const validSortColumns = ['created_at', 'job_title', 'view_count', 'apply_count', 'salary_min', 'updated_at', 'date_posted'];
-    const validSortOrder = ['ASC', 'DESC'];
-    const safeSortBy = validSortColumns.includes(sortBy) ? sortBy : 'created_at';
-    const safeSortOrder = validSortOrder.includes(sortOrder.toUpperCase()) ? sortOrder.toUpperCase() : 'DESC';
-
     // Get total count
     const [countResult] = await pool.query(
       `SELECT COUNT(*) as total FROM jobs j ${whereClause}`,
@@ -96,21 +100,18 @@ export async function GET(request) {
        FROM jobs j
        LEFT JOIN organizations o ON j.organization_id = o.id
        ${whereClause}
-       ORDER BY j.${safeSortBy} ${safeSortOrder}
+       ORDER BY j.${sortBy} ${sortOrder}
        LIMIT ? OFFSET ?`,
       [...queryParams, limit, offset]
     );
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
       data: jobs,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit)
-      }
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
     });
+
+    return addSecurityHeaders(response);
 
   } catch (error) {
     console.error('Error fetching jobs:', error);
@@ -121,55 +122,68 @@ export async function GET(request) {
   }
 }
 
-// POST - Create new job
+// POST - Create new job (REQUIRES AUTHENTICATION)
 export async function POST(request) {
   try {
-    const pool = await getConnection();
-
-    // Get current user from session
+    // Check authentication
     const cookieStore = await cookies();
     const token = cookieStore.get('session_token')?.value;
     const session = token ? await validateSession(token) : null;
-    const currentUserId = session?.userId || null;
 
+    if (!session) {
+      return NextResponse.json(
+        { success: false, error: 'Authentication required' },
+        { status: 401 }
+      );
+    }
+
+    const currentUserId = session.userId;
+    const sessionId = session.id;
+
+    // Check content length
+    const contentLength = request.headers.get('content-length');
+    if (contentLength && parseInt(contentLength) > MAX_PAYLOAD_SIZE) {
+      return NextResponse.json(
+        { success: false, error: 'Request payload too large' },
+        { status: 413 }
+      );
+    }
+
+    const pool = await getConnection();
     const body = await request.json();
-    const {
-      job_title,
-      job_slug,
-      job_description,
-      job_category,
-      job_subcategory,
-      job_status,
-      job_source,
-      employment_type,
-      experience_level,
-      organization_id,
-      country,
-      region,
-      city,
-      remote,
-      salary_min,
-      salary_max,
-      salary_currency,
-      date_posted,
-      valid_through,
-      featured_image,
-      canonical_url,
-      meta_title,
-      meta_description
-    } = body;
+
+    // Sanitize text fields
+    const job_title = sanitizeString(body.job_title, { maxLength: 255 });
+    const job_description = sanitizeString(body.job_description, { maxLength: 10000 });
+    const job_category = sanitizeString(body.job_category, { maxLength: 100 });
+    const job_subcategory = sanitizeString(body.job_subcategory, { maxLength: 100 });
+    const job_status = sanitizeString(body.job_status, { maxLength: 20 });
+    const employment_type = sanitizeString(body.employment_type, { maxLength: 50 });
+    const experience_level = sanitizeString(body.experience_level, { maxLength: 50 });
+    const organization_id = sanitizeString(body.organization_id, { maxLength: 32 });
+    const country = sanitizeString(body.country, { maxLength: 100 });
+    const region = sanitizeString(body.region, { maxLength: 100 });
+    const city = sanitizeString(body.city, { maxLength: 100 });
 
     // Validate required fields
-    if (!job_title) {
+    if (!job_title || job_title.trim().length === 0) {
       return NextResponse.json(
         { success: false, error: 'Job title is required' },
         { status: 400 }
       );
     }
 
-    // Generate ID and slug if not provided
+    // Check for dangerous content
+    if (containsDangerousContent(job_title) || containsDangerousContent(job_description)) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid content detected' },
+        { status: 400 }
+      );
+    }
+
+    // Generate ID and slug
     const id = generateId();
-    const slug = job_slug || job_title
+    const slug = job_title
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-|-$/g, '') + '-' + Date.now();
@@ -187,6 +201,10 @@ export async function POST(request) {
       );
     }
 
+    // Validate numeric fields
+    const salary_min = body.salary_min ? parseFloat(body.salary_min) : null;
+    const salary_max = body.salary_max ? parseFloat(body.salary_max) : null;
+
     // Insert job
     await pool.query(
       `INSERT INTO jobs (
@@ -198,17 +216,17 @@ export async function POST(request) {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
       [
         id, job_title, slug, job_description || null, job_category || null, job_subcategory || null,
-        job_status || 'ACTIVE', job_source || 'DIRECT_CREATION', employment_type || null,
+        job_status || 'ACTIVE', 'DIRECT_CREATION', employment_type || null,
         experience_level || null, organization_id || null,
-        country || null, region || null, city || null, remote ? 1 : 0,
-        salary_min || null, salary_max || null, salary_currency || null,
-        date_posted || null, valid_through || null, featured_image || null,
-        canonical_url || null, meta_title || null, meta_description || null,
+        country || null, region || null, city || null, body.remote ? 1 : 0,
+        salary_min, salary_max, body.salary_currency || null,
+        body.date_posted || null, body.valid_through || null, body.featured_image || null,
+        body.canonical_url || null, body.meta_title || null, body.meta_description || null,
         currentUserId, currentUserId
       ]
     );
 
-    // Fetch the created job with organization info
+    // Fetch the created job
     const [newJob] = await pool.query(
       `SELECT j.*, o.organization_name, o.organization_logo_url
        FROM jobs j
@@ -218,14 +236,15 @@ export async function POST(request) {
     );
 
     // Log audit
-    const sessionId = session?.id || null;
     await auditLogger.logCreate('JOB', id, newJob[0], currentUserId, sessionId, request);
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
       data: newJob[0],
       message: 'Job created successfully'
     }, { status: 201 });
+
+    return addSecurityHeaders(response);
 
   } catch (error) {
     console.error('Error creating job:', error);

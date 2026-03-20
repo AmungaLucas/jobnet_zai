@@ -1,16 +1,69 @@
 import { NextResponse } from 'next/server';
-import { query, transaction } from '@/lib/db';
+import { query } from '@/lib/db';
 import { generateId, hashPassword } from '@/lib/crypto';
 import { createSession, setSessionCookie } from '@/lib/session';
 import auditLogger from '@/lib/audit';
+import { validateEmail, validatePassword, sanitizeString, containsDangerousContent } from '@/lib/sanitize';
+import { checkRateLimit, RATE_LIMITS, getClientIP } from '@/lib/rate-limit';
+import { addSecurityHeaders } from '@/lib/security';
 
 export async function POST(request) {
   try {
-    const { email, password, firstName, lastName } = await request.json();
+    // Get client IP for rate limiting
+    const clientIP = getClientIP(request);
+    const rateLimitKey = `register:${clientIP}`;
+
+    // Check rate limit (stricter for registration)
+    const rateLimitResult = await checkRateLimit(rateLimitKey, RATE_LIMITS.REGISTER);
     
-    if (!email || !password) {
+    if (!rateLimitResult.allowed) {
+      const retryAfter = Math.ceil((rateLimitResult.resetAt - Date.now()) / 1000);
+      
       return NextResponse.json(
-        { error: 'Email and password are required' },
+        { 
+          success: false, 
+          error: 'Too many registration attempts. Please try again later.',
+          retryAfter 
+        },
+        { 
+          status: 429,
+          headers: {
+            'Retry-After': String(retryAfter)
+          }
+        }
+      );
+    }
+
+    const body = await request.json();
+    const { email, password, firstName, lastName } = body;
+    
+    // Validate email
+    const emailValidation = validateEmail(email);
+    if (!emailValidation.valid) {
+      return NextResponse.json(
+        { success: false, error: emailValidation.error },
+        { status: 400 }
+      );
+    }
+    const sanitizedEmail = emailValidation.sanitized;
+
+    // Validate password strength
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return NextResponse.json(
+        { success: false, error: passwordValidation.errors.join('. ') },
+        { status: 400 }
+      );
+    }
+
+    // Sanitize name fields
+    const sanitizedFirstName = sanitizeString(firstName, { maxLength: 100 });
+    const sanitizedLastName = sanitizeString(lastName, { maxLength: 100 });
+
+    // Check for dangerous content in names
+    if (containsDangerousContent(sanitizedFirstName) || containsDangerousContent(sanitizedLastName)) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid characters in name' },
         { status: 400 }
       );
     }
@@ -18,12 +71,12 @@ export async function POST(request) {
     // Check if user exists
     const existing = await query(
       'SELECT id FROM users WHERE email = ?',
-      [email]
+      [sanitizedEmail]
     );
     
     if (existing.length > 0) {
       return NextResponse.json(
-        { error: 'Email already registered' },
+        { success: false, error: 'Email already registered' },
         { status: 400 }
       );
     }
@@ -35,7 +88,7 @@ export async function POST(request) {
     await query(
       `INSERT INTO users (id, email, password_hash, first_name, last_name, role, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [userId, email, passwordHash, firstName || null, lastName || null, 'USER']
+      [userId, sanitizedEmail, passwordHash, sanitizedFirstName || null, sanitizedLastName || null, 'USER']
     );
     
     // Get created user
@@ -72,14 +125,15 @@ export async function POST(request) {
     }, { status: 201 });
     
     response.headers.set('Set-Cookie', cookie);
-    return response;
+    
+    return addSecurityHeaders(response);
     
   } catch (error) {
     console.error('Registration error:', error);
     await auditLogger.logError(error, { request });
     
     return NextResponse.json(
-      { error: 'Internal server error' },
+      { success: false, error: 'Internal server error' },
       { status: 500 }
     );
   }

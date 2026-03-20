@@ -2,12 +2,23 @@ import { NextResponse } from 'next/server';
 import { getConnection } from '@/lib/db';
 import { validateSession } from '@/lib/session';
 import { cookies } from 'next/headers';
+import auditLogger from '@/lib/audit';
+import { sanitizeString, containsDangerousContent } from '@/lib/sanitize';
+import { addSecurityHeaders } from '@/lib/security';
 
-// GET - Get single job by ID
+// GET - Get single job by ID (public, read-only)
 export async function GET(request, { params }) {
   try {
     const pool = await getConnection();
     const { id } = await params;
+
+    // Validate ID format
+    if (!id || !/^[a-f0-9]{24,32}$/i.test(id)) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid job ID' },
+        { status: 400 }
+      );
+    }
 
     const [jobs] = await pool.query(
       `SELECT j.*, o.organization_name, o.organization_logo_url, o.organization_type
@@ -30,10 +41,12 @@ export async function GET(request, { params }) {
       [id]
     );
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
       data: jobs[0]
     });
+
+    return addSecurityHeaders(response);
 
   } catch (error) {
     console.error('Error fetching job:', error);
@@ -44,19 +57,33 @@ export async function GET(request, { params }) {
   }
 }
 
-// PUT - Update job
+// PUT - Update job (REQUIRES AUTHENTICATION)
 export async function PUT(request, { params }) {
   try {
-    const pool = await getConnection();
-    const { id } = await params;
-
-    // Get current user from session
+    // Check authentication
     const cookieStore = await cookies();
     const token = cookieStore.get('session_token')?.value;
     const session = token ? await validateSession(token) : null;
-    const currentUserId = session?.userId || null;
 
-    const body = await request.json();
+    if (!session) {
+      return NextResponse.json(
+        { success: false, error: 'Authentication required' },
+        { status: 401 }
+      );
+    }
+
+    const currentUserId = session.userId;
+    const sessionId = session.id;
+    const pool = await getConnection();
+    const { id } = await params;
+
+    // Validate ID format
+    if (!id || !/^[a-f0-9]{24,32}$/i.test(id)) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid job ID' },
+        { status: 400 }
+      );
+    }
 
     // Check if job exists
     const [existing] = await pool.query(
@@ -71,63 +98,69 @@ export async function PUT(request, { params }) {
       );
     }
 
-    const currentJob = existing[0];
-
-    // Build update query dynamically
+    const body = await request.json();
+    
+    // Build update query dynamically with sanitization
     const updateFields = [];
     const updateValues = [];
 
-    const allowedFields = [
-      'job_title', 'job_slug', 'job_description', 'job_category', 'job_subcategory',
-      'job_status', 'job_source', 'employment_type', 'experience_level', 'organization_id',
-      'country', 'region', 'city', 'remote', 'salary_min', 'salary_max', 'salary_currency',
-      'date_posted', 'valid_through', 'featured_image', 'canonical_url', 'meta_title', 'meta_description',
-      'view_count', 'apply_count'
+    const textFields = [
+      'job_title', 'job_description', 'job_category', 'job_subcategory',
+      'job_status', 'employment_type', 'experience_level', 'organization_id',
+      'country', 'region', 'city', 'salary_currency'
     ];
 
-    for (const field of allowedFields) {
+    for (const field of textFields) {
       if (body[field] !== undefined) {
+        const sanitized = sanitizeString(body[field], { maxLength: 10000 });
+        
+        // Check for dangerous content in title and description
+        if (['job_title', 'job_description'].includes(field) && containsDangerousContent(sanitized)) {
+          return NextResponse.json(
+            { success: false, error: `Invalid content in ${field}` },
+            { status: 400 }
+          );
+        }
+        
         updateFields.push(`${field} = ?`);
-        updateValues.push(body[field]);
+        updateValues.push(sanitized);
       }
     }
 
-    // Check slug uniqueness if being updated
-    if (body.job_slug && body.job_slug !== currentJob.job_slug) {
-      const [slugCheck] = await pool.query(
-        'SELECT id FROM jobs WHERE job_slug = ? AND id != ?',
-        [body.job_slug, id]
-      );
-
-      if (slugCheck.length > 0) {
-        return NextResponse.json(
-          { success: false, error: 'Job with this slug already exists' },
-          { status: 400 }
-        );
-      }
+    // Handle numeric fields
+    if (body.salary_min !== undefined) {
+      updateFields.push('salary_min = ?');
+      updateValues.push(body.salary_min ? parseFloat(body.salary_min) : null);
+    }
+    if (body.salary_max !== undefined) {
+      updateFields.push('salary_max = ?');
+      updateValues.push(body.salary_max ? parseFloat(body.salary_max) : null);
     }
 
-    // Always add updated_by from session
-    updateFields.push('updated_by = ?');
-    updateValues.push(currentUserId);
+    // Handle boolean
+    if (body.remote !== undefined) {
+      updateFields.push('remote = ?');
+      updateValues.push(body.remote ? 1 : 0);
+    }
 
-    // Always update updated_at
-    updateFields.push('updated_at = NOW()');
-
-    if (updateFields.length === 1) {
+    if (updateFields.length === 0) {
       return NextResponse.json(
-        { success: false, error: 'No fields to update' },
+        { success: false, error: 'No valid fields to update' },
         { status: 400 }
       );
     }
 
+    // Add audit fields
+    updateFields.push('updated_by = ?', 'updated_at = NOW()');
+    updateValues.push(currentUserId, id);
+
     // Execute update
     await pool.query(
       `UPDATE jobs SET ${updateFields.join(', ')} WHERE id = ?`,
-      [...updateValues, id]
+      updateValues
     );
 
-    // Fetch updated job with organization info
+    // Fetch updated job
     const [updatedJob] = await pool.query(
       `SELECT j.*, o.organization_name, o.organization_logo_url
        FROM jobs j
@@ -136,11 +169,16 @@ export async function PUT(request, { params }) {
       [id]
     );
 
-    return NextResponse.json({
+    // Log audit
+    await auditLogger.logUpdate('JOB', id, updatedJob[0], currentUserId, sessionId, request);
+
+    const response = NextResponse.json({
       success: true,
       data: updatedJob[0],
       message: 'Job updated successfully'
     });
+
+    return addSecurityHeaders(response);
 
   } catch (error) {
     console.error('Error updating job:', error);
@@ -151,11 +189,33 @@ export async function PUT(request, { params }) {
   }
 }
 
-// DELETE - Delete job
+// DELETE - Delete job (REQUIRES AUTHENTICATION)
 export async function DELETE(request, { params }) {
   try {
+    // Check authentication
+    const cookieStore = await cookies();
+    const token = cookieStore.get('session_token')?.value;
+    const session = token ? await validateSession(token) : null;
+
+    if (!session) {
+      return NextResponse.json(
+        { success: false, error: 'Authentication required' },
+        { status: 401 }
+      );
+    }
+
+    const currentUserId = session.userId;
+    const sessionId = session.id;
     const pool = await getConnection();
     const { id } = await params;
+
+    // Validate ID format
+    if (!id || !/^[a-f0-9]{24,32}$/i.test(id)) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid job ID' },
+        { status: 400 }
+      );
+    }
 
     // Check if job exists
     const [existing] = await pool.query(
@@ -170,18 +230,22 @@ export async function DELETE(request, { params }) {
       );
     }
 
+    // Log audit before deletion
+    await auditLogger.logDelete('JOB', id, existing[0], currentUserId, sessionId, request);
+
     // Delete job
     await pool.query('DELETE FROM jobs WHERE id = ?', [id]);
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
       message: 'Job deleted successfully'
     });
 
+    return addSecurityHeaders(response);
+
   } catch (error) {
     console.error('Error deleting job:', error);
 
-    // Check for foreign key constraint errors
     if (error.code === 'ER_ROW_IS_REFERENCED_2') {
       return NextResponse.json(
         { success: false, error: 'Cannot delete job. It is referenced by other records.' },
