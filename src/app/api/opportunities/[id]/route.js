@@ -24,17 +24,6 @@ export async function GET(request, { params }) {
       );
     }
 
-    // Try to increment view count (ignore if column doesn't exist)
-    try {
-      await pool.query(
-        'UPDATE opportunities SET view_count = COALESCE(view_count, 0) + 1 WHERE id = ?',
-        [id]
-      );
-    } catch (viewCountError) {
-      // Ignore view count errors - column may not exist
-      console.log('View count update skipped:', viewCountError.message);
-    }
-
     return NextResponse.json({
       success: true,
       data: opportunities[0]
@@ -85,9 +74,8 @@ export async function PUT(request, { params }) {
     const allowedFields = [
       'title', 'slug', 'description', 'opportunity_type',
       'status', 'organization_id', 'country', 'region', 'city', 'remote',
-      'eligibility', 'application_url', 'application_deadline', 'start_date', 'end_date',
-      'duration', 'duration_unit', 'benefits', 'requirements', 'featured_image', 'canonical_url',
-      'meta_title', 'meta_description', 'view_count', 'apply_count', 'date_posted', 'valid_through'
+      'featured_image', 'canonical_url', 'meta_title', 'meta_description',
+      'date_posted', 'valid_through'
     ];
 
     for (const field of allowedFields) {

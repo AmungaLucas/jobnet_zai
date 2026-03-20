@@ -3,12 +3,34 @@ import { generateId, generateToken } from './crypto';
 import { getClientInfo } from './device-detection';
 import { serialize } from 'cookie';
 
+// Maximum sessions per user (older sessions will be deleted)
+const MAX_SESSIONS_PER_USER = 5;
+
 export async function createSession(userId, request) {
   const sessionId = generateId();
   const token = generateToken();
   const clientInfo = getClientInfo(request);
   
   const expiresAt = new Date(Date.now() + parseInt(process.env.SESSION_DURATION || '604800000'));
+  
+  // Delete expired sessions for this user first
+  await query(`DELETE FROM user_sessions WHERE user_id = ? AND expires_at < NOW()`, [userId]);
+  
+  // Check current session count and delete oldest if over limit
+  const sessions = await query(
+    `SELECT COUNT(*) as count FROM user_sessions WHERE user_id = ? AND expires_at > NOW()`,
+    [userId]
+  );
+  
+  const currentCount = sessions[0]?.count || 0;
+  
+  if (currentCount >= MAX_SESSIONS_PER_USER) {
+    // Delete oldest sessions to make room
+    await query(
+      `DELETE FROM user_sessions WHERE user_id = ? ORDER BY created_at ASC LIMIT ?`,
+      [userId, currentCount - MAX_SESSIONS_PER_USER + 1]
+    );
+  }
   
   await query(
     `INSERT INTO user_sessions (id, user_id, token, ip_address, user_agent, device_name, device_type, expires_at)
@@ -105,3 +127,23 @@ export function clearSessionCookie() {
     path: '/'
   });
 }
+
+// Clean up all expired sessions in the database
+export async function cleanupExpiredSessions() {
+  const result = await query(`DELETE FROM user_sessions WHERE expires_at < NOW()`);
+  return result.affectedRows || 0;
+}
+
+// Get session statistics
+export async function getSessionStats() {
+  const stats = await query(`
+    SELECT 
+      COUNT(*) as total,
+      SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active,
+      SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired
+    FROM user_sessions
+  `);
+  return stats[0];
+}
+
+export { MAX_SESSIONS_PER_USER };

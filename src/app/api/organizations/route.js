@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
 import { getConnection } from '@/lib/db';
 import { generateId } from '@/lib/crypto';
-import { validateSession } from '@/lib/session';
+import { validateSession, getSessionId } from '@/lib/session';
 import { cookies } from 'next/headers';
+import auditLogger from '@/lib/audit';
 
 // GET - List organizations with search, filters, and pagination
 export async function GET(request) {
@@ -180,6 +181,10 @@ export async function POST(request) {
       'SELECT * FROM organizations WHERE id = ?',
       [id]
     );
+
+    // Log audit
+    const sessionId = session?.id || null;
+    await auditLogger.logCreate('ORGANIZATION', id, newOrg[0], currentUserId, sessionId, request);
 
     return NextResponse.json({
       success: true,

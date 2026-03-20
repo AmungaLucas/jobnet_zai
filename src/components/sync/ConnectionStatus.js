@@ -1,11 +1,56 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import { useSync } from '@/contexts/SyncContext';
+
+// Simple store for tracking client-side mount
+let mounted = false;
+const listeners = new Set();
+
+function subscribe(callback) {
+  listeners.add(callback);
+  return () => listeners.delete(callback);
+}
+
+function getSnapshot() {
+  return mounted;
+}
+
+function getServerSnapshot() {
+  return false;
+}
+
+// Mark as mounted on client
+if (typeof window !== 'undefined') {
+  mounted = true;
+  listeners.forEach(listener => listener());
+}
 
 export default function ConnectionStatus() {
   const { isOnline, isSyncing, syncError } = useSync();
   const [showDetails, setShowDetails] = useState(false);
+  
+  // Use useSyncExternalStore to avoid hydration mismatch
+  const isClient = useSyncExternalStore(
+    subscribe,
+    getSnapshot,
+    getServerSnapshot
+  );
+
+  // Don't render status until mounted on client to avoid hydration mismatch
+  if (!isClient) {
+    return (
+      <div className="fixed bottom-4 right-4 z-50">
+        <button
+          className="flex items-center space-x-2 px-3 py-2 rounded-lg shadow-lg bg-gray-100 text-gray-600"
+          type="button"
+        >
+          <span className="text-lg">⋯</span>
+          <span className="text-sm font-medium">Checking...</span>
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed bottom-4 right-4 z-50">
@@ -18,6 +63,7 @@ export default function ConnectionStatus() {
               : 'bg-green-100 text-green-800'
             : 'bg-red-100 text-red-800'
         }`}
+        type="button"
       >
         <span className="text-lg">
           {isOnline 
@@ -62,6 +108,7 @@ export default function ConnectionStatus() {
             <button
               onClick={() => window.location.reload()}
               className="w-full mt-2 px-3 py-1 bg-blue-500 text-white rounded hover:bg-blue-600"
+              type="button"
             >
               Retry Connection
             </button>

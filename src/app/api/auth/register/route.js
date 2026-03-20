@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { query, transaction } from '@/lib/db';
 import { generateId, hashPassword } from '@/lib/crypto';
+import { createSession, setSessionCookie } from '@/lib/session';
 import auditLogger from '@/lib/audit';
 
 export async function POST(request) {
@@ -43,10 +44,23 @@ export async function POST(request) {
       [userId]
     );
     
-    // Log registration
-    await auditLogger.logCreate('USER', userId, user, null, null, request);
+    // Auto-login: Create session for the new user
+    const session = await createSession(userId, request);
     
-    return NextResponse.json({
+    // Update last login
+    await query(
+      'UPDATE users SET last_login = NOW() WHERE id = ?',
+      [userId]
+    );
+    
+    // Log registration with session ID
+    await auditLogger.logCreate('USER', userId, user, userId, session.sessionId, request);
+    
+    // Set session cookie
+    const cookie = setSessionCookie(session.token, session.expiresAt);
+    
+    // Return response with cookie
+    const response = NextResponse.json({
       success: true,
       user: {
         id: user.id,
@@ -56,6 +70,9 @@ export async function POST(request) {
         role: user.role
       }
     }, { status: 201 });
+    
+    response.headers.set('Set-Cookie', cookie);
+    return response;
     
   } catch (error) {
     console.error('Registration error:', error);

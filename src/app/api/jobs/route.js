@@ -3,6 +3,7 @@ import { getConnection } from '@/lib/db';
 import { generateId } from '@/lib/crypto';
 import { validateSession } from '@/lib/session';
 import { cookies } from 'next/headers';
+import auditLogger from '@/lib/audit';
 
 // GET - List jobs with search, filters, and pagination
 export async function GET(request) {
@@ -215,6 +216,10 @@ export async function POST(request) {
        WHERE j.id = ?`,
       [id]
     );
+
+    // Log audit
+    const sessionId = session?.id || null;
+    await auditLogger.logCreate('JOB', id, newJob[0], currentUserId, sessionId, request);
 
     return NextResponse.json({
       success: true,

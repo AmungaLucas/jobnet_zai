@@ -3,6 +3,7 @@ import { getConnection } from '@/lib/db';
 import { generateId } from '@/lib/crypto';
 import { validateSession } from '@/lib/session';
 import { cookies } from 'next/headers';
+import auditLogger from '@/lib/audit';
 
 // GET - List opportunities with search, filters, and pagination
 export async function GET(request) {
@@ -58,7 +59,7 @@ export async function GET(request) {
       : '';
 
     // Validate sort column
-    const validSortColumns = ['created_at', 'title', 'view_count', 'apply_count', 'updated_at', 'date_posted', 'valid_through'];
+    const validSortColumns = ['created_at', 'title', 'updated_at', 'date_posted', 'valid_through'];
     const validSortOrder = ['ASC', 'DESC'];
     const safeSortBy = validSortColumns.includes(sortBy) ? sortBy : 'created_at';
     const safeSortOrder = validSortOrder.includes(sortOrder.toUpperCase()) ? sortOrder.toUpperCase() : 'DESC';
@@ -124,19 +125,10 @@ export async function POST(request) {
       region,
       city,
       remote,
-      application_url,
-      application_deadline,
-      start_date,
-      end_date,
-      duration,
-      duration_unit,
-      benefits,
-      requirements,
       featured_image,
       canonical_url,
       meta_title,
       meta_description,
-      eligibility,
       date_posted,
       valid_through
     } = body;
@@ -169,25 +161,20 @@ export async function POST(request) {
       );
     }
 
-    // Insert opportunity
+    // Insert opportunity (only using columns that exist in the table)
     await pool.query(
       `INSERT INTO opportunities (
         id, title, slug, description, opportunity_type,
         status, organization_id, country, region, city, remote,
-        application_url, application_deadline, start_date, end_date,
-        duration, duration_unit, benefits, requirements, featured_image, canonical_url,
-        meta_title, meta_description, eligibility, date_posted, valid_through,
-        created_by, updated_at, updated_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+        featured_image, canonical_url, meta_title, meta_description,
+        date_posted, valid_through, created_by, updated_at, updated_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
       [
         id, title, finalSlug, description || null, opportunity_type || null,
         status || 'ACTIVE', organization_id || null,
         country || null, region || null, city || null, remote ? 1 : 0,
-        application_url || null, application_deadline || null,
-        start_date || null, end_date || null,
-        duration || null, duration_unit || null, benefits || null, requirements || null,
         featured_image || null, canonical_url || null, meta_title || null, meta_description || null,
-        eligibility || null, date_posted || null, valid_through || null,
+        date_posted || null, valid_through || null,
         currentUserId, currentUserId
       ]
     );
@@ -200,6 +187,10 @@ export async function POST(request) {
        WHERE o.id = ?`,
       [id]
     );
+
+    // Log audit
+    const sessionId = session?.id || null;
+    await auditLogger.logCreate('OPPORTUNITY', id, newOpportunity[0], currentUserId, sessionId, request);
 
     return NextResponse.json({
       success: true,
